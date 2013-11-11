@@ -9,11 +9,18 @@
 #import "THObserver.h"
 
 #import <objc/message.h>
+#import <objc/runtime.h>
+#import <libkern/OSAtomic.h>
 
 @implementation THObserver {
-    __weak id _observedObject;
     NSString *_keyPath;
     dispatch_block_t _block;
+    
+    // The reason this is __unsafe_unretained, rather than __weak, is so that
+    // it's still valid when our magic deregistration routines, called from
+    // the observed object's dealloc, fire.  If we use __weak, it's zeroed out
+    // before our code runs.
+    __unsafe_unretained id _observedObject;
 }
 
 typedef enum THObserverBlockArgumentsKind {
@@ -36,11 +43,13 @@ typedef enum THObserverBlockArgumentsKind {
             _observedObject = object;
             _keyPath = [keyPath copy];
             _block = [block copy];
-                        
+            
             [_observedObject addObserver:self
                               forKeyPath:_keyPath
                                  options:options
                                  context:(void *)blockArgumentsKind];
+
+            [self _setUpMagicDeregistration];
         }
     }
     return self;
@@ -56,6 +65,26 @@ typedef enum THObserverBlockArgumentsKind {
     [_observedObject removeObserver:self forKeyPath:_keyPath];
     _block = nil;
     _keyPath = nil;
+    
+    // Remove ourselves from the list of active observers of this object (the
+    // list that's used to to remove observers when an object deallocates - see
+    // the "Magic Deregistration" implementation, below, for more
+    // explanation).
+    NSHashTable *myObservers;
+    
+    NSMapTable *objectsToObservers = THObserverObjectsToObservers();
+    @synchronized(objectsToObservers) {
+        myObservers = [objectsToObservers objectForKey:_observedObject];
+    }
+    
+    // if() because myObservers may be nil if we're being called from inside
+    // ReplacementDealloc()
+    if(myObservers) {
+        @synchronized(myObservers) {
+            [myObservers removeObject:self];
+        }
+    }
+    
     _observedObject = nil;
 }
 
@@ -76,6 +105,175 @@ typedef enum THObserverBlockArgumentsKind {
             break;
         default:
             [NSException raise:NSInternalInconsistencyException format:@"%s called on %@ with unrecognised context (%p)", __func__, self, context];
+    }
+}
+
+
+#pragma mark -
+#pragma mark Magic Deregistration
+
+static NSMutableSet *THObserverDeallocSwizzledClasses(void)
+{
+    static NSMutableSet *sDeallocSwizzledClasses;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        sDeallocSwizzledClasses = [NSMutableSet set];
+    });
+    return sDeallocSwizzledClasses;
+}
+
+static NSMapTable *THObserverObjectsToObservers(void)
+{
+    static NSMapTable *sObjectsToObservers;
+    
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        sObjectsToObservers = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsOpaqueMemory | NSPointerFunctionsObjectPointerPersonality
+                                                    valueOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality];
+    });
+    
+    return sObjectsToObservers;
+}
+
+static void ReplacementDealloc(__unsafe_unretained id self)
+{
+    NSHashTable *myObservers = nil;
+    
+    NSMapTable *objectsToObservers = THObserverObjectsToObservers();
+    @synchronized(objectsToObservers) {
+        myObservers = [objectsToObservers objectForKey:self];
+        if(myObservers) {
+            [objectsToObservers removeObjectForKey:self];
+        }
+    }
+    
+    // No need to synchronize access to myObservers here - by this time, the
+    // only place myObservers is accessed is inside dealloc, and that's not
+    // going to be running concurrently with itsself.
+
+    // Note: there will not be any observers in this table if they've
+    // all stopped observing already
+    for(THObserver *observer in myObservers) {
+        // It's safe to call -stopObserving even though it will try to remove
+        // the observer from the myObservers map table because when it looks up
+        // the myObservers map table in objectsToObservers it's going to get
+        // nil back, because we already removed it, above.
+        [observer stopObserving];
+    }
+}
+
+- (void)_setUpMagicDeregistration
+{
+    // We need to make sure that the KVO observation on the observed object is
+    // stopped _before_ its dealloc is called.
+    
+    // The strategy here is to replace the implementation of -dealloc with one
+    // that will deregister any observers before calling the original dealloc.
+    // This must be done _after_ the observation is added so that KVO can do
+    // its magic before we do our raplacement, so that our replacement is
+    // guaranteed to run first.
+    
+    Class objectClass = [_observedObject class];
+    
+    // We only need to do this once per class, so we store what classes we've
+    // already done it to in deallocSwizzledClasses.
+    NSMutableSet *deallocSwizzledClasses = THObserverDeallocSwizzledClasses();
+    @synchronized(deallocSwizzledClasses) {
+        if(![deallocSwizzledClasses containsObject:objectClass]) {
+            const SEL deallocSelector = NSSelectorFromString(@"dealloc");
+
+            // To keep things thread-safe, we fill in the originalDealloc later,
+            // with the result of the class_replaceMethod call (see more comments
+            // below).
+            __block IMP originalDealloc = NULL;
+            __block volatile int32_t originalDeallocIsSet = 0;
+            
+            IMP replacementDeallocImp = imp_implementationWithBlock(^(__unsafe_unretained id impSelf) {
+                ReplacementDealloc(impSelf);
+                
+                while(OSAtomicAdd32(0, &originalDeallocIsSet) != 1) {
+                    // Just in case the originalDealloc isn't set yet, wait
+                    // until we know for sure that it is.
+                    //
+                    // Without a guard mechanism, it's possible that another
+                    // thread could call call dealloc between the call to
+                    // class_replaceMethod swizzling the methods and its
+                    // return value being set.  This would cause us to fall
+                    // through to super's dealloc erroneously, because
+                    // originalDealloc would still be NULL.
+                    //
+                    // Waiting by spinning should be fine - it's very
+                    // implausible that it wouldn' be set yet, and even if it's
+                    // not it will be very soon.
+                }
+                
+                if(originalDealloc) {
+                    // If there was a dealloc at the time we replaced it with
+                    // this block, call it.  It will call [super dealloc] at its
+                    // end, we don't need to worry about that.
+    
+                    // The reason we are casting the IMP to a function pointer
+                    // here is that if we use an IMP, ARC will retain the first
+                    // 'id' argument of an IMP before calling it, because it's
+                    // not defined as __unsafe_unretained.  That's obviously bad
+                    // in the middle of a -dealloc call.
+                    void(*originalDeallocImpFunction)(__unsafe_unretained id, SEL) =
+                        (typeof(originalDeallocImpFunction))originalDealloc;
+                    
+                    originalDeallocImpFunction(impSelf, deallocSelector);
+                } else {
+                    // There was no dealloc method on this class originally.
+                    // Simulate the dynamic falling through to the superclass
+                    // dealloc that would originally have happened.
+                    void(*superDeallocImpFunction)(__unsafe_unretained id, SEL) =
+                        (typeof(superDeallocImpFunction))class_getMethodImplementation(class_getSuperclass(objectClass), deallocSelector);
+                    
+                    superDeallocImpFunction(impSelf, deallocSelector);
+                }
+            });
+            
+            const Method deallocMethod = class_getInstanceMethod(objectClass, deallocSelector);
+            const char *deallocTypeEncoding = method_getTypeEncoding(deallocMethod);
+            
+            // Atomically replace the original dealloc with our replacement IMP,
+            // made above. This will ensure that, in the very unlikely event
+            // that someone else's code on another thread is messing with the
+            // class' method list too, we have a valid -dealloc at all times
+            // (presuming it's doing things in a thread-safe manner too).
+            //
+            // If this returns NULL, there was no implementation originally,
+            // so the class inherited its superclass' one - we deal with that in
+            // replacementDeallocImp's implementation, above.
+            originalDealloc = class_replaceMethod(objectClass,
+                                                  deallocSelector,
+                                                  replacementDeallocImp,
+                                                  deallocTypeEncoding);
+            
+            // Flag that we've set originalDealloc now (see comments in the
+            // replacementDeallocImp block).
+            OSAtomicIncrement32Barrier(&originalDeallocIsSet);
+            
+            [deallocSwizzledClasses addObject:objectClass];
+        }
+    }
+    
+    // Store a reference to ourselves in a list of observers for this object
+    // (creating it if necessary) so that we can look all the observers for an
+    // object up when ReplacementDealloc() is called (see implementation of
+    // ReplacementDealloc, above).
+    NSHashTable *myObservers;
+    
+    NSMapTable *objectsToObservers = THObserverObjectsToObservers();
+    @synchronized(objectsToObservers) {
+        myObservers = [objectsToObservers objectForKey:_observedObject];
+        if(!myObservers) {
+            myObservers = [NSHashTable hashTableWithOptions:NSPointerFunctionsOpaqueMemory | NSPointerFunctionsObjectPointerPersonality];
+            [objectsToObservers setObject:myObservers forKey:_observedObject];
+        }
+    }
+    
+    @synchronized(myObservers) {
+        [myObservers addObject:self];
     }
 }
 
@@ -163,7 +361,7 @@ static NSUInteger SelectorArgumentCount(SEL selector)
             block = [^{
                 id msgTarget = wTarget;
                 if(msgTarget) {
-                    objc_msgSend(msgTarget, action);
+                    ((void(*)(id, SEL))objc_msgSend)(msgTarget, action);
                 }
             } copy];
             blockArgumentsKind = THObserverBlockArgumentsNone;
@@ -173,7 +371,7 @@ static NSUInteger SelectorArgumentCount(SEL selector)
             block = [^{
                 id msgTarget = wTarget;
                 if(msgTarget) {
-                    objc_msgSend(msgTarget, action, wObject);
+                    ((void(*)(id, SEL, id))objc_msgSend)(msgTarget, action, wObject);
                 }
             } copy];
             blockArgumentsKind = THObserverBlockArgumentsNone;
@@ -184,7 +382,7 @@ static NSUInteger SelectorArgumentCount(SEL selector)
             block = [^{
                 id msgTarget = wTarget;
                 if(msgTarget) {
-                    objc_msgSend(msgTarget, action, wObject, myKeyPath);
+                    ((void(*)(id, SEL, id, NSString *))objc_msgSend)(msgTarget, action, wObject, myKeyPath);
                 }
             } copy];
             blockArgumentsKind = THObserverBlockArgumentsNone;
@@ -195,7 +393,7 @@ static NSUInteger SelectorArgumentCount(SEL selector)
             block = [(dispatch_block_t)(^(NSDictionary *change) {
                 id msgTarget = wTarget;
                 if(msgTarget) {
-                    objc_msgSend(msgTarget, action, wObject, myKeyPath, change);
+                    ((void(*)(id, SEL, id, NSString *, NSDictionary *))objc_msgSend)(msgTarget, action, wObject, myKeyPath, change);
                 }
             }) copy];
             blockArgumentsKind = THObserverBlockArgumentsChangeDictionary;
@@ -207,7 +405,7 @@ static NSUInteger SelectorArgumentCount(SEL selector)
             block = [(dispatch_block_t)(^(id oldValue, id newValue) {
                 id msgTarget = wTarget;
                 if(msgTarget) {
-                    objc_msgSend(msgTarget, action, wObject, myKeyPath, oldValue, newValue);
+                    ((void(*)(id, SEL, id, NSString *, id, id))objc_msgSend)(msgTarget, action, wObject, myKeyPath, oldValue, newValue);
                 }
             }) copy];
             blockArgumentsKind = THObserverBlockArgumentsOldAndNew;
@@ -260,7 +458,7 @@ static NSUInteger SelectorArgumentCount(SEL selector)
             block = [^(NSDictionary *change) {
                 id msgTarget = wTarget;
                 if(msgTarget) {
-                    objc_msgSend(msgTarget, valueAction, change[NSKeyValueChangeNewKey]);
+                    ((void(*)(id, SEL, id))objc_msgSend)(msgTarget, valueAction, change[NSKeyValueChangeNewKey]);
                 }
             } copy];
         }
@@ -270,7 +468,7 @@ static NSUInteger SelectorArgumentCount(SEL selector)
             block = [^(NSDictionary *change) {
                 id msgTarget = wTarget;
                 if(msgTarget) {
-                    objc_msgSend(msgTarget, valueAction, change[NSKeyValueChangeOldKey], change[NSKeyValueChangeNewKey]);
+                    ((void(*)(id, SEL, id, id))objc_msgSend)(msgTarget, valueAction, change[NSKeyValueChangeOldKey], change[NSKeyValueChangeNewKey]);
                 }
             } copy];
         }
@@ -282,7 +480,7 @@ static NSUInteger SelectorArgumentCount(SEL selector)
             block = [^(NSDictionary *change) {
                 id msgTarget = wTarget;
                 if(msgTarget) {
-                    objc_msgSend(msgTarget, valueAction, wObject, change[NSKeyValueChangeOldKey], change[NSKeyValueChangeNewKey]);
+                    ((void(*)(id, SEL, id, id, id))objc_msgSend)(msgTarget, valueAction, wObject, change[NSKeyValueChangeOldKey], change[NSKeyValueChangeNewKey]);
                 }
             } copy];
         }

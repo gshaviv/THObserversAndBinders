@@ -48,9 +48,7 @@ typedef enum THObserverBlockArgumentsKind {
 
 - (void)dealloc
 {
-    if(_observedObject) {
-        [self stopObserving];
-    }
+    [self stopObserving];
 }
 
 - (void)stopObserving
